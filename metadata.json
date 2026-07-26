@@ -1,0 +1,6 @@
+{
+  "name": "Med Conscious",
+  "description": "The Intelligence Layer Behind Every Medicine. A next-generation AI-native medication intelligence platform providing conversational search, drug comparisons, prescription analysis, pharmacy discovery, and counterfeit verification.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
