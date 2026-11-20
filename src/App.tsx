@@ -12,7 +12,7 @@ import {
   Plus, Trash2, ChevronDown, ChevronUp, Mic, X, AlertCircle, RefreshCcw, ClipboardList
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Language, SearchResult, ComparisonResult, MultiComparisonResult, PrescriptionAnalysisResult, ChatAnswer, Pharmacy, AuthenticityResult } from './types';
+import { Language, SearchResult, ComparisonResult, MultiComparisonResult, PrescriptionAnalysisResult, ChatAnswer, Pharmacy, AuthenticityResult, EHRSafetyReport, EHRAlertResponse } from './types';
 
 // Preloaded beautiful sample searches
 const SAMPLE_MEDICINES = [
@@ -65,6 +65,7 @@ interface Message {
   prescriptionResult?: PrescriptionAnalysisResult;
   chatResult?: ChatAnswer;
   authenticityResult?: AuthenticityResult;
+  ehrSafetyResult?: EHRSafetyReport;
 
   // UI state persistent for this specific message block
   expandedCards: Record<string, boolean>; // e.g. toggled state of 13 modular search cards
@@ -97,8 +98,71 @@ export default function App() {
   const [medImageErrors, setMedImageErrors] = useState<Record<string, boolean>>({});
   const [medImageLoadedMap, setMedImageLoadedMap] = useState<Record<string, boolean>>({});
 
+  // Patient account context is shared with the PrescriptionSafetyEngine backend.
+  const [patientToken, setPatientToken] = useState<string | null>(() => localStorage.getItem('med_conscious_patient_token'));
+  const [patientProfile, setPatientProfile] = useState<any | null>(() => {
+    const saved = localStorage.getItem('med_conscious_patient_profile');
+    return saved ? JSON.parse(saved) : null;
+  });
+  const [patientAuthMode, setPatientAuthMode] = useState<'register' | 'login'>('register');
+  const [patientAuthError, setPatientAuthError] = useState('');
+  const [patientForm, setPatientForm] = useState({ name: '', email: '', password: '', age: '', sex: 'Female', allergies: '', conditions: '', activeMedications: '' });
+
   const chatEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const updatePatientField = (field: string, value: string) => {
+    setPatientForm(prev => ({ ...prev, [field]: value }));
+  };
+
+  const submitPatientAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPatientAuthError('');
+    try {
+      const endpoint = patientAuthMode === 'register' ? '/api/patient/register' : '/api/patient/login';
+      const body = patientAuthMode === 'register'
+        ? {
+            name: patientForm.name,
+            email: patientForm.email,
+            password: patientForm.password,
+            age: Number(patientForm.age),
+            sex: patientForm.sex,
+            allergies: patientForm.allergies || null,
+            conditions: patientForm.conditions || null,
+            active_medications: patientForm.activeMedications.split(',').map(m => m.trim()).filter(Boolean).map(name => ({ name }))
+          }
+        : { email: patientForm.email, password: patientForm.password };
+      const response = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || data.detail || 'Unable to authenticate');
+      localStorage.setItem('med_conscious_patient_token', data.access_token);
+      localStorage.setItem('med_conscious_patient_profile', JSON.stringify(data.patient));
+      setPatientToken(data.access_token);
+      setPatientProfile(data.patient);
+    } catch (error: any) {
+      setPatientAuthError(error.message || 'Unable to authenticate');
+    }
+  };
+
+  const runPatientSafetyCheck = async (medications: any[]) => {
+    const profileMeds = Array.isArray(patientProfile?.active_medications) ? patientProfile.active_medications : [];
+    const allMedications = [...profileMeds, ...medications].filter((med, index, list) => {
+      const key = String(med.name || med.composition || '').trim().toLowerCase();
+      return key && list.findIndex(item => String(item.name || item.composition || '').trim().toLowerCase() === key) === index;
+    });
+    if (!patientToken || !allMedications.length) return null;
+    const response = await fetch('/api/patient/safety-check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${patientToken}` },
+      body: JSON.stringify({
+        medications: allMedications.map(m => ({ name: m.name || m.composition, dosage: m.dosage || '1-0-0', duration: m.duration, instructions: m.instruction })),
+        allergies: patientProfile?.allergies,
+        conditions: patientProfile?.conditions
+      })
+    });
+    if (!response.ok) throw new Error('Patient safety engine unavailable');
+    return response.json();
+  };
 
   // Auto-scroll chat window when new answers appear
   useEffect(() => {
@@ -246,10 +310,26 @@ export default function App() {
         });
         const data = await response.json();
 
+        // Also fetch EHR drug interaction check in background
+        const ehrPromise = fetch('/api/drug-interactions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            drugs: [data?.overview?.name || cleanQuery.split(/\s+/)[0], "aspirin"]
+          })
+        }).then(r => r.json()).catch(() => ({ ehr_unavailable: true, alerts: [] }));
+
+        setMessages(prev => prev.map(m => m.id === aiMsgId ? {
+          ...m,
+          loading: true,
+          searchResult: data
+        } : m));
+
+        const ehrData = await ehrPromise;
         setMessages(prev => prev.map(m => m.id === aiMsgId ? {
           ...m,
           loading: false,
-          searchResult: data
+          ehrSafetyResult: ehrData
         } : m));
 
       } else if (type === 'compare') {
@@ -288,10 +368,34 @@ export default function App() {
         });
         const data = await response.json();
 
+        // Use the canonical safety engine when the patient is signed in.
+        const ehrPromise = patientToken
+          ? runPatientSafetyCheck(data?.left?.detectedMedicines || [])
+          : fetch('/api/prescription-safety', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            medications: (data?.left?.detectedMedicines || []).map((m: any) => ({
+              name: m.name || m.composition || ''
+            })),
+            patient: {
+              age: parseInt(data?.left?.patientDetails?.age) || undefined,
+              sex: data?.left?.patientDetails?.gender || undefined
+            }
+          })
+        }).then(r => r.json()).catch(() => ({ ehr_unavailable: true, alerts: [] }));
+
+        setMessages(prev => prev.map(m => m.id === aiMsgId ? {
+          ...m,
+          loading: true,
+          prescriptionResult: data
+        } : m));
+
+        const ehrData = await ehrPromise;
         setMessages(prev => prev.map(m => m.id === aiMsgId ? {
           ...m,
           loading: false,
-          prescriptionResult: data
+          ehrSafetyResult: ehrData
         } : m));
 
       } else if (type === 'authenticity') {
@@ -443,6 +547,37 @@ export default function App() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {!patientToken && (
+        <div className="fixed inset-0 z-30 bg-slate-950/55 backdrop-blur-sm flex items-center justify-center p-4">
+          <form onSubmit={submitPatientAuth} className="w-full max-w-lg bg-white rounded-2xl shadow-2xl border border-slate-200 p-6 space-y-4 max-h-[92vh] overflow-y-auto">
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.2em] font-black text-amber-600">Patient safety workspace</div>
+              <h1 className="text-2xl font-black text-slate-950 mt-1">Create your medication profile</h1>
+              <p className="text-sm text-slate-500 mt-1">We use this context for drug–drug and drug–condition safety checks.</p>
+            </div>
+            {patientAuthMode === 'register' && (
+              <>
+                <input required placeholder="Full name" value={patientForm.name} onChange={e => updatePatientField('name', e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" />
+                <div className="grid grid-cols-2 gap-3">
+                  <input required type="number" min="0" max="120" placeholder="Age" value={patientForm.age} onChange={e => updatePatientField('age', e.target.value)} className="border rounded-lg px-3 py-2 text-sm" />
+                  <select value={patientForm.sex} onChange={e => updatePatientField('sex', e.target.value)} className="border rounded-lg px-3 py-2 text-sm"><option>Female</option><option>Male</option><option>Other</option></select>
+                </div>
+                <input placeholder="Allergies (e.g. penicillin, none)" value={patientForm.allergies} onChange={e => updatePatientField('allergies', e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" />
+                <input placeholder="Medical conditions (e.g. asthma, CKD, none)" value={patientForm.conditions} onChange={e => updatePatientField('conditions', e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" />
+                <input placeholder="Active medicines, comma separated" value={patientForm.activeMedications} onChange={e => updatePatientField('activeMedications', e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" />
+              </>
+            )}
+            <input required type="email" placeholder="Email" value={patientForm.email} onChange={e => updatePatientField('email', e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" />
+            <input required type="password" minLength={8} placeholder="Password (minimum 8 characters)" value={patientForm.password} onChange={e => updatePatientField('password', e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" />
+            {patientAuthError && <div className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg p-3">{patientAuthError}</div>}
+            <button type="submit" className="w-full bg-slate-950 text-white rounded-lg py-2.5 font-bold">{patientAuthMode === 'register' ? 'Create patient account' : 'Sign in'}</button>
+            <button type="button" onClick={() => { setPatientAuthMode(patientAuthMode === 'register' ? 'login' : 'register'); setPatientAuthError(''); }} className="w-full text-sm text-slate-500 hover:text-slate-950">
+              {patientAuthMode === 'register' ? 'Already registered? Sign in' : 'New patient? Create an account'}
+            </button>
+          </form>
+        </div>
+      )}
 
       {/* HEADER BAR */}
       <header className="sticky top-0 z-40 bg-white border-b border-slate-200/80 shadow-xs backdrop-blur-md bg-opacity-95">
@@ -1126,6 +1261,17 @@ export default function App() {
                                   color: 'border-slate-800 bg-slate-900 text-white',
                                   clinicalInfo: turn.searchResult.clinicalInfo,
                                   profView: turn.searchResult.professionalView
+                                },
+                                {
+                                  id: 'ehr-safety',
+                                  num: '14',
+                                  title: 'Drug Interaction Safety Report',
+                                  badge: turn.ehrSafetyResult ? (turn.ehrSafetyResult.is_safe ? 'All Clear' : 'ALERTS') : 'EHR Unavailable',
+                                  icon: ShieldCheck,
+                                  color: turn.ehrSafetyResult && !turn.ehrSafetyResult.is_safe
+                                    ? 'border-rose-300 bg-rose-50/20 hover:bg-rose-50/30'
+                                    : 'border-emerald-200 bg-emerald-50/10 hover:bg-emerald-50/20',
+                                  ehrSafety: turn.ehrSafetyResult
                                 }
                               ].map((card) => {
                                 const CardIcon = card.icon;
@@ -1242,11 +1388,44 @@ export default function App() {
                                             )}
                                           </div>
                                         )}
+                                        {card.ehrSafety && (
+                                          <div className="space-y-2">
+                                            <div className="flex items-center justify-between">
+                                              <span className={`text-[9px] font-black px-2 py-0.5 rounded-full uppercase ${
+                                                card.ehrSafety.is_safe ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800'
+                                              }`}>
+                                                {card.ehrSafety.is_safe ? 'SAFE' : `${card.ehrSafety.alerts.length} ALERTS`}
+                                              </span>
+                                              {card.ehrSafety.ehr_unavailable && (
+                                                <span className="text-[9px] text-slate-400 italic">EHR Unavailable</span>
+                                              )}
+                                            </div>
+                                            {card.ehrSafety.alerts && card.ehrSafety.alerts.map((alert: EHRAlertResponse, idx: number) => {
+                                              const sevColor = alert.severity === 'high' || alert.severity === 'critical'
+                                                ? { bg: 'bg-rose-50', border: 'border-rose-200', text: 'text-rose-900', badge: 'bg-rose-500' }
+                                                : alert.severity === 'medium' || alert.severity === 'moderate'
+                                                ? { bg: 'bg-amber-50', border: 'border-amber-200', text: 'text-amber-900', badge: 'bg-amber-500' }
+                                                : { bg: 'bg-sky-50', border: 'border-sky-200', text: 'text-sky-900', badge: 'bg-sky-500' };
+                                              return (
+                                                <div key={idx} className={`p-2.5 ${sevColor.bg} border ${sevColor.border} rounded-lg text-xs space-y-0.5`}>
+                                                  <div className="flex items-center justify-between">
+                                                    <span className={`font-bold text-[10px] ${sevColor.text}`}>{alert.title}</span>
+                                                    <span className={`${sevColor.badge} text-white text-[8px] font-black px-1.5 py-0.5 rounded-full uppercase`}>
+                                                      {alert.severity}
+                                                    </span>
+                                                  </div>
+                                                  <p className="text-[10px] font-semibold text-slate-600">{alert.description}</p>
+                                                  {alert.mechanism && <p className="text-[9px] text-slate-400 italic">Mechanism: {alert.mechanism}</p>}
+                                                </div>
+                                              );
+                                            })}
+                                          </div>
+                                        )}
                                       </motion.div>
                                     ) : (
                                       /* Collapsed Quick summary */
                                       <p className="text-[10px] text-slate-400 truncate mt-1 font-semibold">
-                                        {card.text ? card.text : "Click to unfold full medical mapping..."}
+                                        {card.text ? card.text : card.ehrSafety ? (card.ehrSafety.is_safe ? "No interactions detected ✓" : `${card.ehrSafety.alerts.length} clinical alert(s) found`) : "Click to unfold full medical mapping..."}
                                       </p>
                                     )}
                                   </div>
@@ -1391,6 +1570,51 @@ export default function App() {
                                   <span>{turn.prescriptionResult.right.duplicateTherapyStatus}</span>
                                 </div>
                               </div>
+
+                              {/* EHR Safety Engine Alerts (powered by Prescription Safety Engine) */}
+                              {turn.ehrSafetyResult && !turn.ehrSafetyResult.ehr_unavailable && turn.ehrSafetyResult.alerts && turn.ehrSafetyResult.alerts.length > 0 && (
+                                <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-2xs space-y-3">
+                                  <div className="flex items-center justify-between border-b pb-2">
+                                    <span className="text-[10px] text-slate-400 font-bold uppercase block flex items-center space-x-1.5">
+                                      <ShieldCheck className="w-3.5 h-3.5 text-indigo-500" />
+                                      <span>EHR Clinical Safety Alerts</span>
+                                    </span>
+                                    <span className={`text-[9px] font-black px-2 py-0.5 rounded-full uppercase ${
+                                      turn.ehrSafetyResult.is_safe ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800'
+                                    }`}>
+                                      {turn.ehrSafetyResult.is_safe ? 'SAFE' : 'ALERTS'}
+                                    </span>
+                                  </div>
+                                  <div className="space-y-2">
+                                    {turn.ehrSafetyResult.alerts.map((alert: EHRAlertResponse, idx: number) => {
+                                      const sevColor = alert.severity === 'high' || alert.severity === 'critical'
+                                        ? { bg: 'bg-rose-50', border: 'border-rose-200', text: 'text-rose-900', badge: 'bg-rose-500' }
+                                        : alert.severity === 'medium' || alert.severity === 'moderate'
+                                        ? { bg: 'bg-amber-50', border: 'border-amber-200', text: 'text-amber-900', badge: 'bg-amber-500' }
+                                        : { bg: 'bg-sky-50', border: 'border-sky-200', text: 'text-sky-900', badge: 'bg-sky-500' };
+                                      return (
+                                        <div key={idx} className={`p-3 ${sevColor.bg} border ${sevColor.border} rounded-lg text-xs space-y-1`}>
+                                          <div className="flex items-center justify-between">
+                                            <span className={`font-black uppercase tracking-wide ${sevColor.text}`}>{alert.title}</span>
+                                            <span className={`${sevColor.badge} text-white text-[8px] font-black px-1.5 py-0.5 rounded-full uppercase`}>
+                                              {alert.severity}
+                                            </span>
+                                          </div>
+                                          <p className="font-semibold text-slate-700 leading-relaxed">{alert.description}</p>
+                                          {alert.mechanism && <p className="text-[10px] text-slate-500 italic">Mechanism: {alert.mechanism}</p>}
+                                          {alert.evidence_level && <p className="text-[9px] text-slate-400 font-mono">Evidence: {alert.evidence_level}</p>}
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                  {turn.ehrSafetyResult.ai_insights && (
+                                    <div className="p-3 bg-indigo-50 border border-indigo-150 rounded-lg text-xs font-semibold text-slate-700 leading-relaxed">
+                                      <span className="text-[9px] text-indigo-600 font-black uppercase block mb-0.5">AI Clinical Insight</span>
+                                      {turn.ehrSafetyResult.ai_insights}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
 
                               {/* Brand optimization & generic substitutes mapping */}
                               <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-2xs space-y-3">
@@ -1717,6 +1941,7 @@ export default function App() {
                         <div className="flex flex-wrap gap-1.5">
                           {turn.type === 'search' && [
                             "Compare with Calpol",
+                            "Check Drug Interactions",
                             "Can I take with Milk?",
                             "Pregnancy Safety",
                             "Cheaper Alternatives",
@@ -1730,6 +1955,8 @@ export default function App() {
                                   handleSendMessage(`Compare ${turn.searchResult?.overview.name || 'Dolo 650'} and Calpol 500`, 'compare');
                                 } else if (chip === "Nearby Pharmacy") {
                                   handleSendMessage(`Nearby Pharmacy with ${turn.searchResult?.overview.name || 'Dolo 650'}`, 'pharmacy');
+                                } else if (chip === "Check Drug Interactions") {
+                                  handleSendMessage(`Check drug interactions for ${turn.searchResult?.overview.name || 'Dolo 650'} and Aspirin`);
                                 } else {
                                   handleSendMessage(`${chip} for ${turn.searchResult?.overview.name || 'Dolo 650'}`);
                                 }
@@ -1742,6 +1969,7 @@ export default function App() {
 
                           {turn.type === 'prescription' && [
                             "Check Drug-Drug Interactions",
+                            "Run Clinical Safety Check",
                             "Is duplication present?",
                             "Find alternative brands",
                             "Locate nearby stock"
@@ -1751,6 +1979,8 @@ export default function App() {
                               onClick={() => {
                                 if (chip === "Locate nearby stock") {
                                   handleSendMessage(`Nearby pharmacies stocking prescription items`, 'pharmacy');
+                                } else if (chip === "Run Clinical Safety Check") {
+                                  handleSendMessage(`Run Clinical Safety Check on detected prescription list`);
                                 } else {
                                   handleSendMessage(`${chip} for detected prescription list`);
                                 }

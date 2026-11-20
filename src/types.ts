@@ -25,6 +25,8 @@ export interface DetailedCard {
 
 export interface SearchResult {
   isFallback?: boolean;
+  ehr_unavailable?: boolean;
+  ehrSafety?: EHRSafetyReport;
   overview: MedicineOverview;
   productIntroduction: string;
   whyUsed: string;
@@ -101,6 +103,8 @@ export interface MultiComparisonResult {
 
 export interface PrescriptionAnalysisResult {
   isFallback?: boolean;
+  ehr_unavailable?: boolean;
+  ehrSafety?: EHRSafetyReport;
   left: {
     summary: string;
     patientDetails: {
@@ -167,4 +171,23 @@ export interface AuthenticityResult {
     expiryDate?: string;
     manufacturerRegistered?: boolean;
   };
+}
+
+// ── EHR Safety Engine Integration Types ──
+
+export interface EHRAlertResponse {
+  severity: string;
+  title: string;
+  description: string;
+  mechanism?: string;
+  evidence_level?: string;
+  clinical_significance?: string;
+}
+
+export interface EHRSafetyReport {
+  is_safe: boolean;
+  alerts: EHRAlertResponse[];
+  ai_insights?: string;
+  ai_alternatives?: string[];
+  request_id?: string;
 }

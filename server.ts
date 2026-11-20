@@ -11,11 +11,52 @@ import { GoogleGenAI, Type } from '@google/genai';
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = parseInt(process.env.PORT || '3000', 10);
 
 // Increase payload bounds to allow prescription & packaging photos to be sent via Base64
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// ── EHR API Configuration ──
+const EHR_API_KEY = process.env.EHR_API_KEY || '';
+const EHR_API_BASE_URL = process.env.EHR_API_BASE_URL || '';
+const EHR_CONFIGURED = !!(EHR_API_KEY && EHR_API_KEY !== 'MY_EHR_API_KEY' && EHR_API_BASE_URL);
+
+const SAFETY_API_BASE_URL = process.env.SAFETY_API_BASE_URL || EHR_API_BASE_URL;
+
+async function callPatientSafetyApi(endpoint: string, method: string, body: any, token: string) {
+  if (!SAFETY_API_BASE_URL) throw new Error('SAFETY_API_BASE_URL not configured');
+  const response = await fetch(`${SAFETY_API_BASE_URL}${endpoint}`, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: method === 'GET' ? undefined : JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.detail || `Safety API returned ${response.status}`);
+  return data;
+}
+
+async function callEhrApi(endpoint: string, body: any): Promise<any> {
+  if (!EHR_CONFIGURED) {
+    throw new Error('EHR_API_KEY not configured');
+  }
+  const response = await fetch(`${EHR_API_BASE_URL}${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-API-Key': EHR_API_KEY,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`EHR API returned ${response.status}: ${text}`);
+  }
+  return response.json();
+}
 
 // Helper: safe initialization of Google Gen AI Client
 let aiClient: GoogleGenAI | null = null;
@@ -43,7 +84,15 @@ import { getFallbackSearch, getFallbackComparison, getMultiFallback, getFallback
 
 async function callGeminiWithFallback(params: { contents: any; config?: any }) {
   const client = getGeminiClient();
-  const modelsToTry = ['gemini-flash-latest', 'gemini-3.1-flash-lite', 'gemini-3.5-flash'];
+  const envModel = process.env.GEMINI_MODEL_NAME?.trim();
+  let modelsToTry: string[];
+
+  if (envModel) {
+    modelsToTry = [envModel];
+  } else {
+    modelsToTry = ['gemini-flash-latest', 'gemini-3.1-flash-lite', 'gemini-3.5-flash'];
+  }
+
   let lastError: any = null;
 
   for (const modelName of modelsToTry) {
@@ -571,6 +620,146 @@ app.get('/api/med-image', async (req, res) => {
   } catch (error) {
     console.warn(`Medication image lookup failed for '${query}'. Redirecting to default. Details:`, error.message);
     return res.redirect('https://images.unsplash.com/photo-1584308666744-24d5c474f2ae?w=400&auto=format&fit=crop');
+  }
+});
+
+// ── EHR Safety Engine Proxy Endpoints ──
+
+// 6. Drug-Drug Interaction Check (proxies to Prescription Safety Engine EHR API)
+app.post('/api/drug-interactions', async (req, res) => {
+  const { drugs } = req.body;
+  if (!drugs || !Array.isArray(drugs) || drugs.length < 2) {
+    return res.status(400).json({ error: 'At least two drugs are required for interaction check' });
+  }
+
+  try {
+    const data = await callEhrApi('/safety/check-drugs', { drugs });
+    return res.json(data);
+  } catch (err: any) {
+    console.warn(`EHR API drug-interactions failed: ${err.message}`);
+    return res.json({ ehr_unavailable: true, is_safe: true, alerts: [] });
+  }
+});
+
+// 7. Prescription Safety Check (proxies to EHR check-prescription)
+app.post('/api/prescription-safety', async (req, res) => {
+  const { medications, patient } = req.body;
+  if (!medications || !Array.isArray(medications) || medications.length === 0) {
+    return res.status(400).json({ error: 'At least one medication is required' });
+  }
+
+  try {
+    const data = await callEhrApi('/safety/check-prescription', { medications, patient });
+    return res.json(data);
+  } catch (err: any) {
+    console.warn(`EHR API prescription-safety failed: ${err.message}`);
+    return res.json({ ehr_unavailable: true, is_safe: true, alerts: [] });
+  }
+});
+
+// 8. Hybrid Drug Safety Search — Gemini explanation enriched with EHR DDI data
+app.post('/api/drug-safety-search', async (req, res) => {
+  const { query, lang = 'en' } = req.body;
+  if (!query) {
+    return res.status(400).json({ error: 'Query parameter is required' });
+  }
+
+  try {
+    const client = getGeminiClient();
+    const prompt = `
+      You are Med Conscious, an elite AI medication authority.
+      The user is searching for details on: "${query}" in language code "${lang}".
+
+      You must query medical knowledge and output a strictly structured JSON matching the SearchResult interface.
+      Ensure the language returned matches the given language code "${lang}" for all user-facing content.
+      Languages table: en=English, hi=Hindi, gu=Gujarati, mr=Marathi, ta=Tamil, te=Telugu, bn=Bengali.
+      Provide detailed, trusted, realistic clinical and patient explanations.
+
+      The returned JSON should look exactly like:
+      {
+        "overview": {
+          "name": "Generic or Brand Name of Drug",
+          "composition": "Active Chemical Ingredients",
+          "manufacturer": "Pharmaceutical Lab",
+          "price": "Price range",
+          "strength": "Dose strength",
+          "category": "Therapeutic category",
+          "prescriptionRequired": true or false
+        },
+        "productIntroduction": "Comprehensive introductory overview",
+        "whyUsed": "Plain-English summary",
+        "howItWorks": "Biological mechanism description",
+        "benefits": ["Benefit 1", "Benefit 2", "Benefit 3"],
+        "sideEffects": ["Side effect 1", "Side effect 2"],
+        "foodInteractions": "Warnings regarding food or drink",
+        "drugInteractions": ["Interaction 1 (Severity: High)", "Interaction 2 (Severity: Moderate)"],
+        "pregnancySafety": "FDA pregnancy category",
+        "alternatives": [{"name": "Alt Drug", "price": "₹XX", "matchPercentage": 98}],
+        "priceComparison": { "online": "₹XX", "retail": "₹YY", "savings": "ZZ%" },
+        "nearbyAvailability": [{"pharmacy": "Apollo", "distance": "0.4 km", "status": "In Stock"}],
+        "clinicalInfo": { "drugClass": "Class", "halfLife": "Duration", "dosageRange": "Guidelines", "excretion": "Metabolic clearance" },
+        "patientView": { "simpleExplanation": "Layman description", "whyPrescribed": "Diagnoses", "howToTake": "Steps", "commonSideEffects": "Common issues", "warnings": "Precautions", "interactions": "What to avoid", "availability": "How common", "pricing": "Cost summary" },
+        "professionalView": { "drugClass": "Class", "therapeuticClass": "Taxonomy", "atcClassification": "ATC", "mechanismOfAction": "Molecular detail", "pharmacology": "Principles", "pharmacokinetics": "ADME profile", "contraindications": "Absolute contraindications", "monitoringParameters": "Vital checks", "clinicalReferences": ["Ref 1"] }
+      }
+    `;
+
+    const response = await callGeminiWithFallback({
+      contents: prompt,
+      config: { responseMimeType: 'application/json' }
+    });
+
+    const geminiData = JSON.parse(response.text || '{}');
+
+    // Try to enrich with EHR safety data
+    try {
+      const drugName = (geminiData.overview?.composition || query).split(/\s+/)[0];
+      const ehrData = await callEhrApi('/safety/check-drugs', { drugs: [drugName] });
+      const words = query.toLowerCase().split(/\s+/);
+      const ddiKeywords = ['interaction', 'with', 'and', 'vs', 'versus', 'together'];
+      if (ddiKeywords.some(k => words.includes(k))) {
+        geminiData.ehrSafety = ehrData;
+      }
+    } catch (ehrErr: any) {
+      console.warn(`EHR enrichment failed for drug-safety-search: ${ehrErr.message}`);
+      geminiData.ehr_unavailable = true;
+    }
+
+    return res.json(geminiData);
+  } catch (err: any) {
+    const errStr = String(err.message || err || '');
+    const isRateLimit = err.status === 429 || errStr.includes('429') || errStr.toLowerCase().includes('quota') || errStr.includes('EXHAUSTED');
+    const reason = isRateLimit ? 'Gemini API Rate-Limited / Quota Exceeded (429)' : err.message || 'Connection offline';
+    console.warn(`Drug Safety Search API falling back to local database. Reason: ${reason}`);
+    const fallback = getFallbackSearch(query, lang);
+    return res.json({ ...fallback, isFallback: true, ehr_unavailable: true });
+  }
+});
+
+// ── Patient account and canonical safety engine proxy ──
+app.post('/api/patient/register', async (req, res) => {
+  try {
+    return res.json(await callPatientSafetyApi('/patient/auth/register', 'POST', req.body, ''));
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message || 'Patient registration failed' });
+  }
+});
+
+app.post('/api/patient/login', async (req, res) => {
+  try {
+    return res.json(await callPatientSafetyApi('/patient/auth/login', 'POST', req.body, ''));
+  } catch (err: any) {
+    return res.status(401).json({ error: err.message || 'Patient login failed' });
+  }
+});
+
+app.post('/api/patient/safety-check', async (req, res) => {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  if (!token) return res.status(401).json({ error: 'Patient login required' });
+  try {
+    return res.json(await callPatientSafetyApi('/patient/safety-check', 'POST', req.body, token));
+  } catch (err: any) {
+    console.warn(`Patient safety check failed: ${err.message}`);
+    return res.status(502).json({ error: err.message || 'Safety engine unavailable' });
   }
 });
 
