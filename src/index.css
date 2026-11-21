@@ -1,1 +1,25 @@
 @import "tailwindcss";
+
+:root {
+  --color-primary: #04122e;
+  --color-primary-dark: #030d22;
+  --color-primary-light: #1a2744;
+  --color-medical-blue: #2563eb;
+  --color-medical-blue-dark: #1d4ed8;
+  --color-medical-blue-light: #3b82f6;
+  --color-amber-accent: #fea619;
+  --color-surface: #f8fafc;
+  --font-primary: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-brand: 'Lexend', system-ui, -apple-system, sans-serif;
+}
+
+body {
+  font-family: var(--font-primary);
+  background-color: #f8fafc;
+  color: #0f172a;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, .font-brand {
+  font-family: var(--font-brand);
+}

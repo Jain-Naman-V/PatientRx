@@ -191,3 +191,31 @@ export interface EHRSafetyReport {
   ai_alternatives?: string[];
   request_id?: string;
 }
+
+export interface FactCheckCitation {
+  source: string; // e.g. "CDSCO", "ICMR Guidelines", "National Formulary of India (NFI)", "PubMed"
+  title: string;
+  referenceUrl?: string;
+  quoteOrFinding: string;
+}
+
+export interface FactCheckResult {
+  isFallback?: boolean;
+  claim: string;
+  verdict: 'VERIFIED_SAFE' | 'MYTH_MISLEADING' | 'DANGEROUS' | 'CAUTION_REQUIRED';
+  verdictBadge: string;
+  summary: string;
+  scientificExplanation: string;
+  actionGuidance: string;
+  citations: FactCheckCitation[];
+}
+
+export interface AllergenCatalogItem {
+  id: string;
+  name: string;
+  description: string;
+  common_brands: string;
+  severity: string;
+  sample_ingredients: string[];
+}
+

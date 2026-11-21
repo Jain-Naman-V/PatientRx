@@ -68,12 +68,7 @@ function getGeminiClient(): GoogleGenAI {
       throw new Error('MISSING_KEY');
     }
     aiClient = new GoogleGenAI({
-      apiKey: apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
+      apiKey: apiKey.trim(),
     });
   }
   return aiClient;
@@ -85,30 +80,34 @@ import { getFallbackSearch, getFallbackComparison, getMultiFallback, getFallback
 async function callGeminiWithFallback(params: { contents: any; config?: any }) {
   const client = getGeminiClient();
   const envModel = process.env.GEMINI_MODEL_NAME?.trim();
-  let modelsToTry: string[];
-
-  if (envModel) {
-    modelsToTry = [envModel];
-  } else {
-    modelsToTry = ['gemini-flash-latest', 'gemini-3.1-flash-lite', 'gemini-3.5-flash'];
-  }
+  
+  // Cascade through preferred and reliable models
+  const candidateModels = [
+    ...(envModel ? [envModel] : []),
+    'gemini-3.1-flash-lite',
+    'gemini-3.8-flash',
+    'gemini-2.5-flash',
+  ];
+  const modelsToTry = Array.from(new Set(candidateModels.filter(Boolean)));
 
   let lastError: any = null;
 
   for (const modelName of modelsToTry) {
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
+        console.log(`[Gemini Handler] Attempting call with model: ${modelName} (attempt ${attempt}/2)`);
         const response = await client.models.generateContent({
           model: modelName,
           contents: params.contents,
           config: params.config,
         });
         if (response && response.text) {
+          console.log(`[Gemini Handler] Model ${modelName} succeeded!`);
           return response;
         }
       } catch (err: any) {
         lastError = err;
-        console.log(`[Gemini Handler] Model ${modelName} transition state (attempt ${attempt}/2)`);
+        console.error(`[Gemini Handler] Model ${modelName} attempt ${attempt}/2 error:`, err?.message || err);
         await new Promise((resolve) => setTimeout(resolve, 300));
       }
     }
@@ -452,16 +451,37 @@ app.post('/api/prescription', async (req, res) => {
 
 // 4. Medication Chat / Conversational Perplexity-Style Intelligence
 app.post('/api/chat', async (req, res) => {
-  const { message, history = [], lang = 'en' } = req.body;
+  const { message, history = [], lang = 'en', patientContext } = req.body;
   if (!message) {
     return res.status(400).json({ error: 'Message parameter is required' });
   }
 
   try {
     const client = getGeminiClient();
+
+    let contextSection = '';
+    if (patientContext && (patientContext.name || patientContext.allergies || patientContext.conditions)) {
+      contextSection = `
+        PATIENT MEDICAL PROFILE:
+        - Patient Name: ${patientContext.name || 'User'}
+        - Age & Sex: ${patientContext.age || 'Not stated'} yrs, ${patientContext.sex || 'Not stated'}
+        - Known Drug Allergies: ${patientContext.allergies || 'None reported'}
+        - Chronic Conditions: ${patientContext.conditions || 'None reported'}
+        - Active Daily Medications: ${JSON.stringify(patientContext.active_medications || [])}
+        CLINICAL MANDATE: You MUST actively evaluate if the medicines or symptoms asked about conflict with this patient's documented allergies (${patientContext.allergies || 'None'}) or conditions (${patientContext.conditions || 'None'}). Address them by name and explicitly state if it is safe or requires caution.
+      `;
+    } else {
+      contextSection = `
+        PATIENT CONTEXT: Patient is NOT signed in / medical profile is unknown.
+        CLINICAL MANDATE: Give the accurate medical explanation. At the end, gently remind the patient that they can tell you their chronic conditions or allergies (e.g. Diabetes, Penicillin allergy) to get tailored interaction warnings.
+      `;
+    }
+
     const prompt = `
       You are Med Conscious Core Chat intelligence, a friendly digital medicine consultant.
       The user is asking: "${message}" in language code "${lang}".
+
+      ${contextSection}
 
       History context check: ${JSON.stringify(history)}
 
@@ -752,6 +772,16 @@ app.post('/api/patient/login', async (req, res) => {
   }
 });
 
+app.put('/api/patient/profile', async (req, res) => {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  if (!token) return res.status(401).json({ error: 'Patient login required' });
+  try {
+    return res.json(await callPatientSafetyApi('/patient/profile', 'PUT', req.body, token));
+  } catch (err: any) {
+    return res.status(502).json({ error: err.message || 'Patient profile update failed' });
+  }
+});
+
 app.post('/api/patient/safety-check', async (req, res) => {
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
   if (!token) return res.status(401).json({ error: 'Patient login required' });
@@ -760,6 +790,115 @@ app.post('/api/patient/safety-check', async (req, res) => {
   } catch (err: any) {
     console.warn(`Patient safety check failed: ${err.message}`);
     return res.status(502).json({ error: err.message || 'Safety engine unavailable' });
+  }
+});
+
+// ── AI Fact-Check with Cited Scientific Verdicts ──
+app.post('/api/fact-check', async (req, res) => {
+  const { claim, lang = 'en' } = req.body;
+  if (!claim) {
+    return res.status(400).json({ error: 'Claim text is required' });
+  }
+
+  try {
+    const client = getGeminiClient();
+    const prompt = `
+      You are Med Conscious Clinical Fact-Checking Authority.
+      The user is asking to verify this medicine/health claim or rumor: "${claim}" (Language code: "${lang}").
+
+      Evaluate against authoritative sources: CDSCO (Central Drugs Standard Control Organisation), ICMR (Indian Council of Medical Research), National Formulary of India (NFI), WHO, and peer-reviewed clinical pharmacology literature.
+
+      Return a strictly formatted JSON object matching FactCheckResult:
+      {
+        "claim": "${claim.replace(/"/g, '\\"')}",
+        "verdict": "VERIFIED_SAFE" | "MYTH_MISLEADING" | "DANGEROUS" | "CAUTION_REQUIRED",
+        "verdictBadge": "e.g. ❌ Dangerous Myth, or ✅ Clinically Verified Safe, or ⚠️ Caution Advised",
+        "summary": "Clear, reassuring 2-sentence plain-language verdict for the patient translated into language code '${lang}'",
+        "scientificExplanation": "Detailed pharmacological reason and risk breakdown translated into language code '${lang}'",
+        "actionGuidance": "Actionable, direct instruction on what the patient should do translated into language code '${lang}'",
+        "citations": [
+          {
+            "source": "CDSCO / ICMR / National Formulary of India (NFI) / PubMed",
+            "title": "Specific advisory or clinical study title",
+            "quoteOrFinding": "Relevant clinical takeaway"
+          }
+        ]
+      }
+    `;
+
+    const response = await callGeminiWithFallback({
+      contents: prompt,
+      config: { responseMimeType: 'application/json' },
+    });
+
+    const data = JSON.parse(response.text || '{}');
+    return res.json(data);
+  } catch (err: any) {
+    console.warn(`Fact-check fallback triggered for: ${claim}`);
+    return res.json({
+      isFallback: true,
+      claim,
+      verdict: 'CAUTION_REQUIRED',
+      verdictBadge: '⚠️ Caution: Requires Clinical Verification',
+      summary: 'This claim involves drug safety parameters that require clinician supervision. Avoid discontinuing or combining potent medications based solely on informal claims.',
+      scientificExplanation: 'Drug pharmacokinetics, liver enzyme interactions, and clinical conditions require individualized medical review.',
+      actionGuidance: 'Please confirm with your attending doctor or registered clinical pharmacist before making changes to your regimen.',
+      citations: [
+        {
+          source: 'CDSCO Drug Safety Notice',
+          title: 'Advisory on Self-Medication & Prescription Integrity',
+          quoteOrFinding: 'Medicines should only be consumed under medical direction.'
+        }
+      ]
+    });
+  }
+});
+
+// ── Master Allergens Catalog Proxy ──
+app.get('/api/allergies', async (req, res) => {
+  try {
+    const data = await callPatientSafetyApi('/allergies', 'GET', null, '');
+    return res.json(data);
+  } catch (err: any) {
+    return res.json([
+      { id: 'penicillins', name: 'Penicillins & Beta-Lactams', description: 'Beta-lactam antibiotics', common_brands: 'Augmentin, Mox', severity: 'High', sample_ingredients: ['amoxicillin', 'ampicillin'] },
+      { id: 'cephalosporins', name: 'Cephalosporins', description: 'Broad-spectrum antibiotics', common_brands: 'Cefix, Taxim', severity: 'High', sample_ingredients: ['cefixime', 'cefuroxime'] },
+      { id: 'nsaids', name: 'NSAIDs & Aspirin', description: 'Pain relievers and blood thinners', common_brands: 'Ecosprin, Combiflam', severity: 'High', sample_ingredients: ['aspirin', 'ibuprofen', 'diclofenac'] },
+      { id: 'sulfa', name: 'Sulfonamides (Sulfa)', description: 'Sulfa antibiotics', common_brands: 'Bactrim, Septran', severity: 'High', sample_ingredients: ['sulfamethoxazole'] },
+      { id: 'macrolides', name: 'Macrolides', description: 'Respiratory antibiotics', common_brands: 'Azithral, Rulide', severity: 'Moderate', sample_ingredients: ['azithromycin'] },
+      { id: 'statins', name: 'Statins', description: 'Cholesterol-lowering agents', common_brands: 'Atorva, Rosuvas', severity: 'Moderate', sample_ingredients: ['atorvastatin', 'rosuvastatin'] }
+    ]);
+  }
+});
+
+// ── Patient Consented Sharing Endpoints ──
+app.post('/api/patient/consent/grant', async (req, res) => {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  if (!token) return res.status(401).json({ error: 'Patient login required' });
+  try {
+    return res.json(await callPatientSafetyApi('/patient/consent/grant', 'POST', req.body, token));
+  } catch (err: any) {
+    return res.status(502).json({ error: err.message || 'Unable to grant consent' });
+  }
+});
+
+app.get('/api/patient/consent/active', async (req, res) => {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  if (!token) return res.status(401).json({ error: 'Patient login required' });
+  try {
+    return res.json(await callPatientSafetyApi('/patient/consent/active', 'GET', null, token));
+  } catch (err: any) {
+    return res.status(502).json({ error: err.message || 'Unable to fetch active consent' });
+  }
+});
+
+app.post('/api/patient/consent/revoke', async (req, res) => {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  if (!token) return res.status(401).json({ error: 'Patient login required' });
+  try {
+    return res.json(await callPatientSafetyApi('/patient/consent/revoke', 'POST', req.body, token));
+  } catch (err: any) {
+    return res.status(502).json({ error: err.message || 'Unable to revoke consent' });
   }
 });
 
