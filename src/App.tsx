@@ -104,8 +104,18 @@ export default function App() {
     activeMedications: ''
   });
 
-  // Master Allergens Catalog from Backend
-  const [allergensList, setAllergensList] = useState<AllergenCatalogItem[]>([]);
+  // Master Allergens Default Catalog
+  const DEFAULT_ALLERGENS: AllergenCatalogItem[] = [
+    { id: 'penicillins', name: 'Penicillins & Beta-Lactams', description: 'Beta-lactam antibiotics', common_brands: 'Augmentin, Mox', severity: 'High', sample_ingredients: ['amoxicillin', 'ampicillin'] },
+    { id: 'cephalosporins', name: 'Cephalosporins', description: 'Broad-spectrum antibiotics', common_brands: 'Cefix, Taxim', severity: 'High', sample_ingredients: ['cefixime', 'cefuroxime'] },
+    { id: 'nsaids', name: 'NSAIDs & Aspirin', description: 'Pain relievers and blood thinners', common_brands: 'Ecosprin, Combiflam', severity: 'High', sample_ingredients: ['aspirin', 'ibuprofen', 'diclofenac'] },
+    { id: 'sulfa', name: 'Sulfonamides (Sulfa)', description: 'Sulfa antibiotics', common_brands: 'Bactrim, Septran', severity: 'High', sample_ingredients: ['sulfamethoxazole'] },
+    { id: 'macrolides', name: 'Macrolides', description: 'Respiratory antibiotics', common_brands: 'Azithral, Rulide', severity: 'Moderate', sample_ingredients: ['azithromycin'] },
+    { id: 'statins', name: 'Statins', description: 'Cholesterol-lowering agents', common_brands: 'Atorva, Rosuvas', severity: 'Moderate', sample_ingredients: ['atorvastatin', 'rosuvastatin'] }
+  ];
+
+  // Master Allergens Catalog from Backend (with resilient local defaults)
+  const [allergensList, setAllergensList] = useState<AllergenCatalogItem[]>(DEFAULT_ALLERGENS);
   const [cabinetSafetyAlerts, setCabinetSafetyAlerts] = useState<any[]>([]);
 
   // ── AI Chat Buddy State ──
@@ -122,11 +132,18 @@ export default function App() {
   // Fetch Master Allergens Catalog on Mount
   useEffect(() => {
     fetch('/api/allergies')
-      .then(res => res.json())
-      .then(data => {
-        if (Array.isArray(data)) setAllergensList(data);
+      .then(async res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const contentType = res.headers.get('content-type');
+        if (!contentType || !contentType.includes('application/json')) {
+          throw new Error('Non-JSON response');
+        }
+        return res.json();
       })
-      .catch(err => console.warn('Could not load allergens catalog:', err));
+      .then(data => {
+        if (Array.isArray(data) && data.length > 0) setAllergensList(data);
+      })
+      .catch(err => console.warn('Could not load allergens catalog from live backend, keeping default catalog:', err.message || err));
   }, []);
 
   // Fetch Active Consent if Logged In
@@ -135,7 +152,12 @@ export default function App() {
       fetch('/api/patient/consent/active', {
         headers: { Authorization: `Bearer ${patientToken}` }
       })
-        .then(res => res.json())
+        .then(async res => {
+          if (!res.ok) return null;
+          const contentType = res.headers.get('content-type');
+          if (!contentType || !contentType.includes('application/json')) return null;
+          return res.json();
+        })
         .then(data => {
           if (data?.has_active_consent) {
             setActiveConsent({
@@ -161,6 +183,9 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query: q, lang })
       });
+      if (!res.ok) {
+        throw new Error(`Server returned HTTP ${res.status}`);
+      }
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to fetch medicine details');
       setActiveMedicine(data);
@@ -193,6 +218,9 @@ export default function App() {
           medications: [...cabinetMeds, { name: newMedName }]
         })
       });
+      if (!res.ok) {
+        throw new Error(`Server returned HTTP ${res.status}`);
+      }
       const data = await res.json();
       if (data?.alerts) {
         setCabinetSafetyAlerts(data.alerts);
@@ -218,7 +246,10 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ imageBase64: base64, lang })
         });
-        const data = await res.json();
+        if (!res.ok) {
+        throw new Error(`Server returned HTTP ${res.status}`);
+      }
+      const data = await res.json();
         setPrescriptionData(data);
         setActiveTab('home');
       } catch (err) {
@@ -241,6 +272,9 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ claim, lang })
       });
+      if (!res.ok) {
+        throw new Error(`Server returned HTTP ${res.status}`);
+      }
       const data = await res.json();
       setFactCheckResult(data);
     } catch (err) {
@@ -260,6 +294,9 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ batchNumber: authenticityBatch, lang })
       });
+      if (!res.ok) {
+        throw new Error(`Server returned HTTP ${res.status}`);
+      }
       const data = await res.json();
       setAuthenticityResult(data);
     } catch (err) {
@@ -286,6 +323,9 @@ export default function App() {
         },
         body: JSON.stringify({ duration_hours: 24, purpose: 'doctor_consultation' })
       });
+      if (!res.ok) {
+        throw new Error(`Server returned HTTP ${res.status}`);
+      }
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to grant consent');
       setActiveConsent({
@@ -343,6 +383,9 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
+      if (!res.ok) {
+        throw new Error(`Server returned HTTP ${res.status}`);
+      }
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || data.detail || 'Authentication failed');
 
@@ -382,6 +425,9 @@ export default function App() {
           } : null
         })
       });
+      if (!res.ok) {
+        throw new Error(`Server returned HTTP ${res.status}`);
+      }
       const data = await res.json();
       setChatMessages(prev => [
         ...prev,

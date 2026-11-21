@@ -17,6 +17,21 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
+// Normalize routes so endpoints work whether requested with /api prefix or without
+const API_ENDPOINTS = [
+  'search', 'compare', 'compare-multi', 'prescription', 'chat', 'authenticity',
+  'med-image', 'drug-interactions', 'prescription-safety', 'drug-safety-search',
+  'patient/register', 'patient/login', 'patient/profile', 'patient/safety-check',
+  'fact-check', 'allergies', 'patient/consent/grant', 'patient/consent/active', 'patient/consent/revoke'
+];
+app.use((req, res, next) => {
+  const cleanPath = req.path.replace(/^\//, '');
+  if (!req.url.startsWith('/api/') && API_ENDPOINTS.some(ep => cleanPath === ep || cleanPath.startsWith(ep + '/'))) {
+    req.url = '/api' + req.url;
+  }
+  next();
+});
+
 // ── EHR API Configuration ──
 const EHR_API_KEY = process.env.EHR_API_KEY || '';
 const EHR_API_BASE_URL = process.env.EHR_API_BASE_URL || '';
@@ -905,24 +920,29 @@ app.post('/api/patient/consent/revoke', async (req, res) => {
 
 // ---- FRONTEND VITE INTEGRATION ----
 
-// In development, hook up the Vite dev server middleware
-if (process.env.NODE_ENV !== 'production') {
-  const { createServer: createViteServer } = await import('vite');
-  const vite = await createViteServer({
-    server: { middlewareMode: true },
-    appType: 'spa',
-  });
-  app.use(vite.middlewares);
-} else {
-  // In production, serve the compiled assets
-  const distPath = path.join(process.cwd(), 'dist');
-  app.use(express.static(distPath));
-  // ServeSPA fallback
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(distPath, 'index.html'));
+// In development, hook up the Vite dev server middleware (when not on Vercel Serverless)
+if (!process.env.VERCEL) {
+  if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    // In production standalone node server, serve the compiled assets
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    // ServeSPA fallback
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Med Conscious Full-Stack Server starting on http://0.0.0.0:${PORT}`);
   });
 }
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Med Conscious Full-Stack Server starting on http://0.0.0.0:${PORT}`);
-});
+export default app;
+export { app };
