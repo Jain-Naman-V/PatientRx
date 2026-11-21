@@ -119,7 +119,7 @@ export default function App() {
   const [cabinetSafetyAlerts, setCabinetSafetyAlerts] = useState<any[]>([]);
 
   // ── AI Chat Buddy State ──
-  const [chatMessages, setChatMessages] = useState<Array<{ sender: 'user' | 'ai'; text: string; citations?: string[]; isFallback?: boolean }>>([
+  const [chatMessages, setChatMessages] = useState<Array<{ sender: 'user' | 'ai'; text: string; citations?: string[]; isFallback?: boolean; suggestedFollowUp?: string[] }>>([
     {
       sender: 'ai',
       text: "Namaste! I am your MedConscious digital health consultant. Ask me anything about your medicines, dosage timings, food interactions, or side effects."
@@ -414,6 +414,10 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
           message: msg, 
+          history: chatMessages.map(m => ({
+            sender: m.sender,
+            text: m.text
+          })),
           lang,
           patientContext: patientProfile ? {
             name: patientProfile.name,
@@ -435,7 +439,8 @@ export default function App() {
           sender: 'ai',
           text: data.quickAnswer ? `${data.quickAnswer}\n\n${data.detailedExplanation || ''}` : (data.reply || 'Consult a healthcare professional.'),
           citations: data.safetyNotes ? [data.safetyNotes] : undefined,
-          isFallback: data.isFallback
+          isFallback: data.isFallback,
+          suggestedFollowUp: Array.isArray(data.suggestedFollowUp) ? data.suggestedFollowUp : undefined
         }
       ]);
     } catch (err) {
@@ -1258,6 +1263,20 @@ export default function App() {
                       <div className="pt-2 border-t border-slate-200/50 text-[10px] text-amber-900 font-bold flex items-center space-x-1">
                         <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
                         <span>{m.citations[0]}</span>
+                      </div>
+                    )}
+                    {m.suggestedFollowUp && m.suggestedFollowUp.length > 0 && (
+                      <div className="pt-2 border-t border-slate-200/50 flex flex-wrap gap-1.5 mt-2">
+                        {m.suggestedFollowUp.map((fu, fidx) => (
+                          <button
+                            key={fidx}
+                            type="button"
+                            onClick={() => handleSendChatMessage(fu)}
+                            className="bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 rounded-full px-2.5 py-1 text-[11px] font-semibold transition-colors text-left"
+                          >
+                            💬 {fu}
+                          </button>
+                        ))}
                       </div>
                     )}
                   </div>

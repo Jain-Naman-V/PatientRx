@@ -321,8 +321,27 @@ export function getFallbackPrescription(lang: string): PrescriptionAnalysisResul
   };
 }
 
-export function getFallbackChat(message: string, lang: string): ChatAnswer {
+export function getFallbackChat(message: string, lang: string, history: any[] = []): ChatAnswer {
   const m = message.toLowerCase();
+  const histText = Array.isArray(history) 
+    ? history.map((h: any) => (typeof h === 'string' ? h : (h.text || h.content || ''))).join(' ').toLowerCase() 
+    : '';
+  const fullContext = `${histText} ${m}`;
+
+  if (m.includes('which one') || m.includes('first') || m.includes('order') || m.includes('schedule') || m.includes('plan')) {
+    if (fullContext.includes('thyroid') || fullContext.includes('levothyroxine') || fullContext.includes('gastric') || fullContext.includes('antacid') || fullContext.includes('ppi') || fullContext.includes('pantoprazole') || fullContext.includes('omeprazole')) {
+      return {
+        quickAnswer: "Take Thyroid medication first upon waking on an empty stomach, followed by your gastric medication after the required interval.",
+        detailedExplanation: "1. Thyroid Medication First: Take your thyroid hormone (e.g. Levothyroxine) immediately upon waking with a full glass of plain water on an empty stomach.\n2. Wait 30 to 60 Minutes: Wait at least 30 to 60 minutes before having breakfast, tea, or coffee to allow full absorption.\n3. Gastric Medication (PPI / Antacid): If you are taking a PPI (such as Pantoprazole or Omeprazole), take it 30-60 minutes before your first meal. If taking an antacid or supplements with calcium, aluminum, or magnesium, wait at least 4 hours after taking your thyroid medication to prevent binding interactions.",
+        safetyNotes: "Thyroid absorption requires stomach acid and is easily blocked by antacids and food. Maintaining a clear gap ensures your TSH levels remain stable.",
+        relatedMedicines: ["Levothyroxine (Thyronorm/Eltroxin)", "Pantoprazole (Pantocid)", "Omeprazole"],
+        suggestedFollowUp: [
+          "Can I drink tea or coffee after taking thyroid medicine?",
+          "Why must antacids be separated by 4 hours from thyroid medication?"
+        ]
+      };
+    }
+  }
   
   if (m.includes('milk')) {
     return {

@@ -492,13 +492,54 @@ app.post('/api/chat', async (req, res) => {
       `;
     }
 
+    // Format conversation history for multi-turn context retention
+    let formattedHistory = '';
+    if (Array.isArray(history) && history.length > 0) {
+      const turns = history
+        .filter((h: any) => {
+          if (!h) return false;
+          const txt = typeof h === 'string' ? h : (h.text || h.content || '');
+          if (!txt || typeof txt !== 'string') return false;
+          if (txt.trim().startsWith('Namaste! I am your MedConscious')) return false;
+          return true;
+        })
+        .slice(-10) // preserve the last 10 messages for rich multi-turn continuity
+        .map((h: any) => {
+          const isUser = (h.sender === 'user' || h.role === 'user');
+          const speaker = isUser ? 'Patient' : 'MedConscious AI Consultant';
+          const content = typeof h === 'string' ? h : (h.text || h.content || '');
+          return `${speaker}: ${content.trim()}`;
+        });
+
+      if (turns.length > 0) {
+        formattedHistory = `
+        ACTIVE CONVERSATION HISTORY (Previous discussion in this consultation):
+        ${turns.join('\n\n')}
+        `;
+      }
+    }
+
     const prompt = `
-      You are Med Conscious Core Chat intelligence, a friendly digital medicine consultant.
-      The user is asking: "${message}" in language code "${lang}".
+      You are Med Conscious Core Chat intelligence, an elite evidence-based clinical digital medicine consultant.
 
       ${contextSection}
 
-      History context check: ${JSON.stringify(history)}
+      ${formattedHistory}
+
+      CURRENT PATIENT QUESTION: "${message}" (Language code requested: "${lang}").
+
+      CRITICAL CONTEXT CONTINUITY & FOLLOW-UP MANDATE:
+      1. CONTINUOUS CONSULTATION:
+         - You are having an ongoing, multi-turn clinical consultation with the patient.
+         - Carefully check the ACTIVE CONVERSATION HISTORY above.
+         - If the current message is a follow-up (e.g., "which one to take first?", "how do we plan so we can take both?", "what are its side effects?", "can I take it with milk?"), you MUST anchor your response directly to the specific medications, dosages, and interactions established earlier in the conversation (such as Thyroid medication vs Gastric medication / PPIs / Antacids).
+         - Resolve all pronouns and ambiguous references ("it", "they", "them", "which one", "both") using the medications and topics from the conversation history. Do NOT ask the user to re-specify medicines that have already been identified in previous turns.
+         - Never reset context or provide generic, abstract advice when specific medications were already under discussion.
+      2. DIRECT ACTIONABLE ADVICE:
+         - In "quickAnswer", provide an immediate, unambiguous answer (e.g., explicitly specify which medication to take first and the exact time gap).
+         - In "detailedExplanation", give clear step-by-step morning / daily schedule instructions with clinical rationale (such as empty stomach absorption vs binding interactions).
+      3. PATIENT SAFETY:
+         - Highlight critical separation times (e.g. 30-60 min for empty stomach; 4 hours for antacids/calcium/iron binding).
 
       Generate a beautiful, visual, and modular Perplexity-style answer structure matching the ChatAnswer interface.
       The output must be JSON format only, matching:
@@ -530,7 +571,7 @@ app.post('/api/chat', async (req, res) => {
     const isRateLimit = err.status === 429 || errStr.includes('429') || errStr.toLowerCase().includes('quota') || errStr.includes('EXHAUSTED');
     const reason = isRateLimit ? 'Gemini API Rate-Limited / Quota Exceeded (429)' : err.message || 'Connection offline';
     console.warn(`Chat API falling back to local database. Reason: ${reason}`);
-    const fallback = getFallbackChat(message, lang);
+    const fallback = getFallbackChat(message, lang, history);
     return res.json({ ...fallback, isFallback: true });
   }
 });
